@@ -1,0 +1,627 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+shopt -s nullglob
+
+VERSION="0.1.0"
+
+WORKDIR="."
+SUPP_DIR=""
+OUT_DIR=""
+RUN_PATTERN="MYSW-*"
+SAMPLE_PATTERN="Sample_*"
+MANIFEST=""
+MANIFEST_ABS=""
+MANIFEST_DIR_ABS=""
+DRY_RUN=0
+FORCE=0
+INCLUDE_SUPP_ONLY=0
+JOBS=1
+FAIL=0
+PIDS=()
+declare -A PROCESSED_SUPP=()
+
+usage() {
+    cat <<'EOF'
+merge-fastq - merge original and resequenced FASTQ files
+
+Usage:
+  merge-fastq --workdir DIR --supp-dir DIR --out-dir DIR [options]
+  merge-fastq --manifest FILE [--out-dir DIR] [options]
+
+Common modes:
+  1. Auto-discovery mode
+     Search original run directories under --workdir, exclude --supp-dir,
+     then merge matching Sample_*/*.fastq.gz files.
+
+     merge-fastq \
+       --workdir ./ \
+       --supp-dir MYSW-20260420-L-01-2026-04-221434 \
+       --out-dir combined
+
+  2. Simple manifest mode
+     Manifest columns:
+       original_fq,supp_fq,out_fq
+
+     merge-fastq --manifest merge_plan.csv
+
+  3. sample/read manifest mode
+     Manifest columns:
+       sample,read,original_fq,supp_fq
+
+     The output path is generated as:
+       --out-dir/sample/basename(original_fq)
+
+     merge-fastq --manifest merge_plan.csv --out-dir combined
+
+Manifest rules:
+  - If out_fq is provided, it is always used as the output path.
+  - Absolute out_fq paths are used as-is, even when --out-dir is also given.
+  - Relative out_fq paths, including filenames only, are resolved under --out-dir
+    when --out-dir is given; otherwise they are resolved under the manifest directory.
+  - Relative original_fq and supp_fq paths in a manifest are resolved under the
+    manifest directory.
+  - If out_fq is absent, sample + read + original_fq + --out-dir are required.
+  - sample/read are recorded in merge_summary.tsv when available.
+
+Options:
+  --workdir DIR             Project directory for auto-discovery mode. Default: .
+  --supp-dir DIR            Resequencing/supplement run directory.
+                            Relative paths are resolved under --workdir.
+  --out-dir DIR             Output directory.
+                            Required for auto-discovery mode and sample/read manifest mode.
+  --manifest FILE           CSV manifest file.
+  --run-pattern PATTERN     Run directory glob in auto-discovery mode. Default: MYSW-*
+  --sample-pattern PATTERN  Sample directory glob in auto-discovery mode. Default: Sample_*
+  --include-supp-only       Also output files present only in --supp-dir during auto-discovery.
+  --dry-run                 Print and write the merge plan without creating FASTQ outputs.
+  --force                   Allow overwriting existing output FASTQ and md5 files.
+  -j, --jobs INT            Number of concurrent merge jobs. Default: 1.
+                            This is job-level parallelism, not multi-threaded cat/gzip/md5sum.
+  --version                 Print version and exit.
+  -h, --help                Show this help message.
+
+Outputs:
+  - merged/copied FASTQ files
+  - one md5 file per output FASTQ: <fastq>.md5
+  - merge.log
+  - merge_summary.tsv
+  - md5sum.txt
+
+Notes:
+  - Merge order is always original_fq first, then supp_fq.
+  - gzip -t is run for every generated FASTQ unless --dry-run is used.
+  - Existing outputs are protected by default; use --force to overwrite.
+EOF
+}
+
+log() {
+    local level="$1"
+    local msg="$2"
+    if [[ -n "${LOG:-}" ]]; then
+        printf '[%s] %s\n' "${level}" "${msg}" | tee -a "${LOG}"
+    else
+        printf '[%s] %s\n' "${level}" "${msg}" >&2
+    fi
+}
+
+die() {
+    log "ERROR" "$1"
+    exit 1
+}
+
+csv_trim() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    value="${value%$'\r'}"
+    printf '%s' "${value}"
+}
+
+abs_path() {
+    local path="$1"
+    local abs
+    if [[ "${path}" = /* ]]; then
+        abs="${path}"
+    else
+        abs="$(pwd)/${path}"
+    fi
+    normalize_path "${abs}"
+}
+
+normalize_path() {
+    local path="$1"
+    if command -v realpath >/dev/null 2>&1 && realpath -m / >/dev/null 2>&1; then
+        realpath -m "${path}"
+    elif command -v readlink >/dev/null 2>&1 && readlink -m / >/dev/null 2>&1; then
+        readlink -m "${path}"
+    else
+        printf '%s\n' "${path}"
+    fi
+}
+
+abs_path_from_base() {
+    local base="$1"
+    local path="$2"
+    if [[ "${path}" = /* ]]; then
+        normalize_path "${path}"
+    else
+        normalize_path "${base}/${path}"
+    fi
+}
+
+resolve_under_workdir() {
+    local path="$1"
+    if [[ "${path}" = /* ]]; then
+        normalize_path "${path}"
+    else
+        normalize_path "${WORKDIR_ABS}/${path}"
+    fi
+}
+
+resolve_manifest_out_fq() {
+    local path="$1"
+    if [[ "${path}" = /* ]]; then
+        normalize_path "${path}"
+    elif [[ -n "${OUT_DIR_ABS}" ]]; then
+        normalize_path "${OUT_DIR_ABS}/${path}"
+    else
+        abs_path_from_base "${MANIFEST_DIR_ABS}" "${path}"
+    fi
+}
+
+require_command() {
+    local cmd="$1"
+    command -v "${cmd}" >/dev/null 2>&1 || die "Required command not found: ${cmd}"
+}
+
+ensure_parent_dir() {
+    local path="$1"
+    local parent
+    parent="$(dirname "${path}")"
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        mkdir -p "${parent}"
+    fi
+}
+
+write_summary_header() {
+    printf 'sample\tread\toriginal_fq\tsupp_fq\tout_fq\tstatus\toriginal_size\tsupp_size\tout_size\n' > "${SUMMARY}"
+}
+
+file_size_or_na() {
+    local path="$1"
+    if [[ -n "${path}" && "${path}" != "NA" && -f "${path}" ]]; then
+        stat -c '%s' "${path}"
+    else
+        printf 'NA'
+    fi
+}
+
+append_summary() {
+    local sample="$1"
+    local read_name="$2"
+    local original_fq="$3"
+    local supp_fq="$4"
+    local out_fq="$5"
+    local status="$6"
+    local original_size supp_size out_size
+
+    original_size="$(file_size_or_na "${original_fq}")"
+    supp_size="$(file_size_or_na "${supp_fq}")"
+    out_size="$(file_size_or_na "${out_fq}")"
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "${sample:-NA}" \
+        "${read_name:-NA}" \
+        "${original_fq:-NA}" \
+        "${supp_fq:-NA}" \
+        "${out_fq}" \
+        "${status}" \
+        "${original_size}" \
+        "${supp_size}" \
+        "${out_size}" >> "${SUMMARY}"
+}
+
+append_md5sum() {
+    local out_fq="$1"
+    local md5_file="$2"
+    local md5_value
+    md5_value="$(awk '{print $1}' "${md5_file}")"
+    printf '%s  %s\n' "${md5_value}" "${out_fq}" >> "${MD5SUM_ALL}"
+}
+
+wait_for_oldest_job() {
+    local pid
+    pid="${PIDS[0]}"
+    if ! wait "${pid}"; then
+        FAIL=1
+    fi
+    PIDS=("${PIDS[@]:1}")
+}
+
+queue_pair() {
+    if [[ "${JOBS}" -le 1 ]]; then
+        process_pair "$@"
+        return
+    fi
+
+    (
+        process_pair "$@"
+    ) &
+    PIDS+=("$!")
+
+    if [[ "${#PIDS[@]}" -ge "${JOBS}" ]]; then
+        wait_for_oldest_job
+    fi
+}
+
+finish_jobs() {
+    while [[ "${#PIDS[@]}" -gt 0 ]]; do
+        wait_for_oldest_job
+    done
+
+    [[ "${FAIL}" -eq 0 ]] || die "One or more merge jobs failed"
+}
+
+check_output_path() {
+    local out_fq="$1"
+    local md5_file="${out_fq}.md5"
+
+    if [[ "${FORCE}" -eq 0 ]]; then
+        [[ ! -e "${out_fq}" ]] || die "Output file exists. Use --force to overwrite: ${out_fq}"
+        [[ ! -e "${md5_file}" ]] || die "MD5 file exists. Use --force to overwrite: ${md5_file}"
+    fi
+}
+
+process_pair() {
+    local sample="$1"
+    local read_name="$2"
+    local original_fq="$3"
+    local supp_fq="$4"
+    local out_fq="$5"
+    local status
+    local md5_file="${out_fq}.md5"
+    local out_dir fq_base
+
+    [[ -n "${out_fq}" ]] || die "Internal error: empty output FASTQ path"
+    check_output_path "${out_fq}"
+
+    if [[ -n "${original_fq}" && "${original_fq}" != "NA" && ! -f "${original_fq}" ]]; then
+        die "Original FASTQ not found: ${original_fq}"
+    fi
+
+    if [[ -n "${supp_fq}" && "${supp_fq}" != "NA" && ! -f "${supp_fq}" ]]; then
+        log "WARN" "Supplement FASTQ not found, original will be copied only: ${supp_fq}"
+        supp_fq="NA"
+    fi
+
+    if [[ "${original_fq}" == "NA" || -z "${original_fq}" ]]; then
+        [[ "${supp_fq}" != "NA" && -n "${supp_fq}" && -f "${supp_fq}" ]] || die "No usable FASTQ input for output: ${out_fq}"
+        status="supp_only"
+        log "INFO" "Copy supplement only: ${supp_fq} -> ${out_fq}"
+    elif [[ "${supp_fq}" != "NA" && -n "${supp_fq}" && -f "${supp_fq}" ]]; then
+        status="merged"
+        log "INFO" "Merge: ${original_fq} + ${supp_fq} -> ${out_fq}"
+    else
+        status="copied_original_only"
+        log "INFO" "Copy original only: ${original_fq} -> ${out_fq}"
+    fi
+
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        ensure_parent_dir "${out_fq}"
+
+        if [[ "${status}" == "merged" ]]; then
+            cat "${original_fq}" "${supp_fq}" > "${out_fq}"
+        elif [[ "${status}" == "supp_only" ]]; then
+            cp "${supp_fq}" "${out_fq}"
+        else
+            cp "${original_fq}" "${out_fq}"
+        fi
+
+        gzip -t "${out_fq}"
+
+        out_dir="$(dirname "${out_fq}")"
+        fq_base="$(basename "${out_fq}")"
+        (
+            cd "${out_dir}"
+            md5sum "${fq_base}" > "${fq_base}.md5"
+        )
+        append_md5sum "${out_fq}" "${md5_file}"
+        log "INFO" "MD5 generated: ${md5_file}"
+    fi
+
+    append_summary "${sample}" "${read_name}" "${original_fq}" "${supp_fq}" "${out_fq}" "${status}"
+}
+
+parse_args() {
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            --workdir)
+                WORKDIR="${2:-}"
+                shift 2
+                ;;
+            --supp-dir)
+                SUPP_DIR="${2:-}"
+                shift 2
+                ;;
+            --out-dir)
+                OUT_DIR="${2:-}"
+                shift 2
+                ;;
+            --manifest)
+                MANIFEST="${2:-}"
+                shift 2
+                ;;
+            --run-pattern)
+                RUN_PATTERN="${2:-}"
+                shift 2
+                ;;
+            --sample-pattern)
+                SAMPLE_PATTERN="${2:-}"
+                shift 2
+                ;;
+            --include-supp-only)
+                INCLUDE_SUPP_ONLY=1
+                shift
+                ;;
+            -j|--jobs)
+                JOBS="${2:-}"
+                shift 2
+                ;;
+            --dry-run)
+                DRY_RUN=1
+                shift
+                ;;
+            --force)
+                FORCE=1
+                shift
+                ;;
+            --version)
+                printf '%s\n' "${VERSION}"
+                exit 0
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                printf 'Unknown option: %s\n\n' "$1" >&2
+                usage >&2
+                exit 1
+                ;;
+        esac
+    done
+}
+
+header_index() {
+    local wanted="$1"
+    local i
+    for i in "${!HEADERS[@]}"; do
+        if [[ "${HEADERS[$i]}" == "${wanted}" ]]; then
+            printf '%s' "${i}"
+            return 0
+        fi
+    done
+    printf '%s' "-1"
+}
+
+get_field() {
+    local index="$1"
+    if [[ "${index}" -ge 0 ]]; then
+        printf '%s' "$(csv_trim "${FIELDS[$index]:-}")"
+    else
+        printf ''
+    fi
+}
+
+run_manifest_mode() {
+    local manifest_abs line line_no
+    local idx_sample idx_read idx_original idx_supp idx_out
+    local sample read_name original_fq supp_fq out_fq
+    local original_base
+
+    manifest_abs="${MANIFEST_ABS:-$(abs_path "${MANIFEST}")}"
+    [[ -f "${manifest_abs}" ]] || die "Manifest not found: ${manifest_abs}"
+    MANIFEST_DIR_ABS="$(dirname "${manifest_abs}")"
+
+    IFS= read -r line < "${manifest_abs}" || die "Manifest is empty: ${manifest_abs}"
+    IFS=',' read -r -a HEADERS <<< "${line}"
+    local i
+    for i in "${!HEADERS[@]}"; do
+        HEADERS[$i]="$(csv_trim "${HEADERS[$i]}")"
+    done
+
+    idx_sample="$(header_index "sample")"
+    idx_read="$(header_index "read")"
+    idx_original="$(header_index "original_fq")"
+    idx_supp="$(header_index "supp_fq")"
+    idx_out="$(header_index "out_fq")"
+
+    [[ "${idx_original}" -ge 0 ]] || die "Manifest requires column: original_fq"
+    [[ "${idx_supp}" -ge 0 ]] || die "Manifest requires column: supp_fq"
+
+    if [[ "${idx_out}" -lt 0 ]]; then
+        [[ "${idx_sample}" -ge 0 ]] || die "Manifest without out_fq requires column: sample"
+        [[ "${idx_read}" -ge 0 ]] || die "Manifest without out_fq requires column: read"
+        [[ -n "${OUT_DIR}" ]] || die "Manifest without out_fq requires --out-dir"
+    fi
+
+    log "INFO" "Manifest: ${manifest_abs}"
+    line_no=1
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line_no=$((line_no + 1))
+        [[ -n "$(csv_trim "${line}")" ]] || continue
+        [[ "$(csv_trim "${line}")" != \#* ]] || continue
+
+        IFS=',' read -r -a FIELDS <<< "${line}"
+
+        sample="$(get_field "${idx_sample}")"
+        read_name="$(get_field "${idx_read}")"
+        original_fq="$(get_field "${idx_original}")"
+        supp_fq="$(get_field "${idx_supp}")"
+        out_fq="$(get_field "${idx_out}")"
+
+        [[ -n "${original_fq}" ]] || die "Line ${line_no}: original_fq is empty"
+        [[ -n "${supp_fq}" ]] || supp_fq="NA"
+
+        if [[ -z "${out_fq}" ]]; then
+            [[ -n "${sample}" ]] || die "Line ${line_no}: sample is required when out_fq is empty"
+            [[ -n "${read_name}" ]] || die "Line ${line_no}: read is required when out_fq is empty"
+            [[ -n "${OUT_DIR_ABS}" ]] || die "Line ${line_no}: --out-dir is required when out_fq is empty"
+            original_base="$(basename "${original_fq}")"
+            out_fq="${OUT_DIR_ABS}/${sample}/${original_base}"
+        else
+            out_fq="$(resolve_manifest_out_fq "${out_fq}")"
+        fi
+
+        if [[ "${original_fq}" != /* ]]; then
+            original_fq="$(abs_path_from_base "${MANIFEST_DIR_ABS}" "${original_fq}")"
+        else
+            original_fq="$(normalize_path "${original_fq}")"
+        fi
+        if [[ "${supp_fq}" != "NA" && "${supp_fq}" != /* ]]; then
+            supp_fq="$(abs_path_from_base "${MANIFEST_DIR_ABS}" "${supp_fq}")"
+        elif [[ "${supp_fq}" != "NA" ]]; then
+            supp_fq="$(normalize_path "${supp_fq}")"
+        fi
+
+        queue_pair "${sample}" "${read_name}" "${original_fq}" "${supp_fq}" "${out_fq}"
+    done < <(tail -n +2 "${manifest_abs}")
+    finish_jobs
+}
+
+run_auto_mode() {
+    local supp_abs out_abs run_dir sample_dir sample_name
+    local fq fq_base supp_fq out_fq supp_sample_dir
+    local found_run=0
+    local supp_only_sample_dir supp_only_fq
+
+    [[ -n "${SUPP_DIR}" ]] || die "Auto-discovery mode requires --supp-dir"
+    [[ -n "${OUT_DIR}" ]] || die "Auto-discovery mode requires --out-dir"
+
+    supp_abs="$(resolve_under_workdir "${SUPP_DIR}")"
+    out_abs="${OUT_DIR_ABS}"
+    [[ -d "${supp_abs}" ]] || die "Supplement directory not found: ${supp_abs}"
+
+    log "INFO" "Workdir: ${WORKDIR_ABS}"
+    log "INFO" "Supplement directory: ${supp_abs}"
+    log "INFO" "Output directory: ${out_abs}"
+
+    for run_dir in "${WORKDIR_ABS}"/${RUN_PATTERN}; do
+        [[ -d "${run_dir}" ]] || continue
+        [[ "${run_dir}" != "${supp_abs}" ]] || continue
+        [[ "${run_dir}" != "${out_abs}" ]] || continue
+
+        found_run=1
+        log "INFO" "Original run directory: ${run_dir}"
+
+        for sample_dir in "${run_dir}"/${SAMPLE_PATTERN}; do
+            [[ -d "${sample_dir}" ]] || continue
+            sample_name="$(basename "${sample_dir}")"
+            supp_sample_dir="${supp_abs}/${sample_name}"
+
+            if [[ ! -d "${supp_sample_dir}" ]]; then
+                log "WARN" "Supplement sample directory not found, original will be copied only: ${supp_sample_dir}"
+            fi
+
+            for fq in "${sample_dir}"/*.fastq.gz; do
+                [[ -f "${fq}" ]] || continue
+                fq_base="$(basename "${fq}")"
+                supp_fq="${supp_sample_dir}/${fq_base}"
+                out_fq="${out_abs}/${sample_name}/${fq_base}"
+                if [[ -f "${supp_fq}" ]]; then
+                    PROCESSED_SUPP["${supp_fq}"]=1
+                fi
+                queue_pair "${sample_name}" "NA" "${fq}" "${supp_fq}" "${out_fq}"
+            done
+        done
+    done
+
+    [[ "${found_run}" -eq 1 ]] || die "No original run directories found with pattern '${RUN_PATTERN}' under ${WORKDIR_ABS}"
+
+    if [[ "${INCLUDE_SUPP_ONLY}" -eq 1 ]]; then
+        log "INFO" "Scanning supplement-only FASTQ files"
+        for supp_only_sample_dir in "${supp_abs}"/${SAMPLE_PATTERN}; do
+            [[ -d "${supp_only_sample_dir}" ]] || continue
+            sample_name="$(basename "${supp_only_sample_dir}")"
+            for supp_only_fq in "${supp_only_sample_dir}"/*.fastq.gz; do
+                [[ -f "${supp_only_fq}" ]] || continue
+                [[ -z "${PROCESSED_SUPP[${supp_only_fq}]:-}" ]] || continue
+                fq_base="$(basename "${supp_only_fq}")"
+                out_fq="${out_abs}/${sample_name}/${fq_base}"
+                [[ -e "${out_fq}" && "${FORCE}" -eq 0 ]] && continue
+                queue_pair "${sample_name}" "NA" "NA" "${supp_only_fq}" "${out_fq}"
+            done
+        done
+    fi
+    finish_jobs
+}
+
+main() {
+    parse_args "$@"
+
+    [[ "${JOBS}" =~ ^[1-9][0-9]*$ ]] || die "--jobs/-j must be a positive integer: ${JOBS}"
+
+    require_command gzip
+    require_command md5sum
+    require_command stat
+    require_command awk
+
+    WORKDIR_ABS="$(abs_path "${WORKDIR}")"
+    [[ -d "${WORKDIR_ABS}" ]] || die "Workdir not found: ${WORKDIR_ABS}"
+
+    if [[ -n "${MANIFEST}" ]]; then
+        MANIFEST_ABS="$(abs_path "${MANIFEST}")"
+        [[ -f "${MANIFEST_ABS}" ]] || die "Manifest not found: ${MANIFEST_ABS}"
+        MANIFEST_DIR_ABS="$(dirname "${MANIFEST_ABS}")"
+    fi
+
+    if [[ -n "${OUT_DIR}" ]]; then
+        if [[ "${OUT_DIR}" = /* ]]; then
+            OUT_DIR_ABS="$(normalize_path "${OUT_DIR}")"
+        elif [[ -n "${MANIFEST}" ]]; then
+            OUT_DIR_ABS="$(abs_path_from_base "${MANIFEST_DIR_ABS}" "${OUT_DIR}")"
+        else
+            OUT_DIR_ABS="$(normalize_path "${WORKDIR_ABS}/${OUT_DIR}")"
+        fi
+    else
+        OUT_DIR_ABS=""
+    fi
+
+    if [[ -n "${OUT_DIR_ABS}" ]]; then
+        mkdir -p "${OUT_DIR_ABS}"
+        LOG="${OUT_DIR_ABS}/merge.log"
+        SUMMARY="${OUT_DIR_ABS}/merge_summary.tsv"
+        MD5SUM_ALL="${OUT_DIR_ABS}/md5sum.txt"
+    elif [[ -n "${MANIFEST}" ]]; then
+        LOG="$(pwd)/merge.log"
+        SUMMARY="$(pwd)/merge_summary.tsv"
+        MD5SUM_ALL="$(pwd)/md5sum.txt"
+    else
+        LOG="$(pwd)/merge.log"
+        SUMMARY="$(pwd)/merge_summary.tsv"
+        MD5SUM_ALL="$(pwd)/md5sum.txt"
+    fi
+
+    : > "${LOG}"
+    write_summary_header
+    : > "${MD5SUM_ALL}"
+
+    log "INFO" "merge-fastq version ${VERSION}"
+    log "INFO" "Jobs: ${JOBS}"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        log "INFO" "Dry-run mode: FASTQ, gzip test, and md5 generation will be skipped"
+    fi
+
+    if [[ -n "${MANIFEST}" ]]; then
+        run_manifest_mode
+    else
+        run_auto_mode
+    fi
+
+    log "INFO" "Summary: ${SUMMARY}"
+    log "INFO" "MD5 list: ${MD5SUM_ALL}"
+    log "INFO" "Done"
+}
+
+main "$@"

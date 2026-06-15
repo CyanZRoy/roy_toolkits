@@ -1,0 +1,3 @@
+original_fq,supp_fq,out_fq
+/data/project/original/Sample_001/A_R1.fastq.gz,/data/project/reseq/Sample_001/A_R1.fastq.gz,A_R1.fastq.gz
+/data/project/original/Sample_001/A_R2.fastq.gz,/data/project/reseq/Sample_001/A_R2.fastq.gz,A_R2.fastq.gz

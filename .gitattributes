@@ -1,0 +1,4 @@
+*.sh text eol=lf
+bin/* text eol=lf
+tools/*/bin/* text eol=lf
+tools/*/test/*.sh text eol=lf
